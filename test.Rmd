@@ -1,0 +1,141 @@
+---
+title: "STAN Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Scenario
+
+We're running a Bayesian Network Meta-Analysis of aggregate data using the 'Diabetes' scenario from Dias et al. (2011). The data describe 22 multi-arm studies of hypertension treatments, with number of new cases of Diabetes at follow-up as a dependent measure. Studies used varying follow-up times, so time is a covariate. Time is assumed to have a non-linear relationship to outcome, modeled by the authors with a cloglog link. The original analyses carried out fixed- and random-effects tests in WinBUGS, finding the random-effects models provided a better fit. The reference treatment was Diuretic.
+
+# Analysis in R
+
+We begin by loading in the data, transformed into R long form:
+```{r}
+data=read.csv("data.csv", header=TRUE)
+head(data)
+```
+These data will be analysed using the R interface for STAN, which provides some recommended settings when the library is loaded, so I'll go ahead and follow those recommendations.
+```{r message=FALSE}
+library("dplyr")
+library("rstan")
+#Use all but one of the multi-cores for MCMC
+options(mc.cores = parallel::detectCores() -1) 
+rstan_options(auto_write = TRUE)
+```
+In order to try to bootstrap some familiarity with STAN, I explored a few tutorials and posts on the mc-STAN.org website. Unfortunately, there is no clear path to be followed from the elementary *getting started* examples to the more complex network examples, such as the STAN implementation of the  Dietary Fat example that immediately precedes the Diabetes example in Dias et al. (2011). However, in my exploration, I was able to find the **multinma** package which uses wrapper functions to facilitate model specification and build the appropriate STAN code for a network meta-analysis:
+```{r  message=FALSE}
+library("multinma")
+```
+A network meta-analysis (nma) using aggregated data (agd) is generated using the set_agd_arm function:
+```{r}
+db_net <- set_agd_arm(data, 
+                      study = studyc,
+                      trt = trtc,
+                      trt_ref="Diuretic",
+                      r = r, 
+                      n = n)
+```
+By default, the model will select the reference treatment that optimizes computation time. In Dias et al. (2011), Diuretic was chosen as the reference condition, and so this can be entered here. If **trt_ref** is omitted, a network reference treatment will be chosen for efficiency and stability, and a desired trt_ref can be provided later, when comparing relative effects and making predictions using the computed model. This function generates a list object. ***r*** is the number of events of interest and ***n*** is the total number of observations. The binomial model will model the event rates (number of events relative to the n for each treatment, ***trtc***), taking into account the follow-up time (***time***), which will be used as a covariate after a log transformation.
+
+Next, we create our models using uninformative priors. We will start with the fixed effects model:
+```{r}
+db_fit_FE <- nma(db_net, 
+                 trt_effects = "fixed",
+                 link = "cloglog",
+                 regression = ~offset(log(time)),
+                 prior_intercept = normal(scale = 100),
+                 prior_trt = normal(scale = 100))
+```
+Per Dias et al. (2011), a complementary log-log (cloglog) link is used when the proportion of patients reaching an end-point covaries with the follow-up time (offset) used in the study. In the diabetes study, patient follow-ups occurred between 3 and 6.1 years, the probability of an event in arm k of trial i after follow-up time f_i is 1-exp(-lambda f_i) (i.e., 1 minus the probability of NO events by the follow-up time), which is a nonlinear function. The cloglog link allows this function into a GLM framework.
+
+We can now specify the random effects model:
+```{r}
+db_fit_RE <- nma(db_net, 
+                 trt_effects = "random",
+                 link = "cloglog",
+                 regression = ~offset(log(time)),
+                 prior_intercept = normal(scale = 10),
+                 prior_trt = normal(scale = 10),
+                 prior_het = half_normal(scale = 5),
+                 init_r = 0.5)
+```
+New parameters specified here are required for random effects models: **prior_het**, the prior distribution for heterogeneity, and **init_r**, which narrows the possible range for random initial values.
+
+The nma function returns a list object that contains several objects, including the network and an **rstan** stanfit object. The STAN code that was generated and compiled can be exported:
+```{r message=FALSE}
+code=get_stancode(db_fit_RE$stanfit)
+#sink("stancode.txt")
+#cat(code)
+#sink()
+```
+I was surprised to find that the code generated for the random and fixed effects models was identical, with if-statements controlling code execution according to the **trt_type** parameter. In fact, an inspection of the code indicated that the same STAN code block would have been generated for an individual-subject analysis. I would have to explore different paradigms to see which factors, if any, lead to different STAN code generation. However, the generated code blocks are not written for clarity, and therefore not terribly helpful for learning STAN.
+
+Now we use the dic() function to get the deviance information criterion (DIC) to compare model fits:
+```{r}
+dic_FE = dic(db_fit_FE)
+dic_RE = dic(db_fit_RE)
+```
+And we compute relative effects of each treatment compared to baseline Diuretic using the relative_effects function for each model:
+```{r}
+db_relative_FE = relative_effects(db_fit_FE, trt_ref = "Diuretic")
+db_relative_RE = relative_effects(db_fit_RE, trt_ref = "Diuretic")
+```
+# Summary Table Generation
+Here we recreate the tables from Dias et al. (2011). First the treatment effects relative to diuretic:
+```{r}
+conditionlist=c('Placebo', 'BetaBlocker', 'CCB', 'ACEInhib', 'ARB')
+columnlist=c('Mean', 'SD', 'Median', 'CrI_lower', 'CrI_upper')
+FE_sum_tbl=as.matrix(round(db_relative_FE$summary[c(5,3,4,1,2),c(4,5,8,6,10)],2))
+RE_sum_tbl=as.matrix(round(db_relative_RE$summary[c(5,3,4,1,2),c(4,5,8,6,10)],2))
+rownames(FE_sum_tbl)=conditionlist
+colnames(FE_sum_tbl)=columnlist
+rownames(RE_sum_tbl)=conditionlist
+colnames(RE_sum_tbl)=columnlist
+
+```
+Next, predictions of the absolute effects of treatment (the probability of developing diabetes, matched for follow-up offset of 3 years and assuming the cloglog of developing diabetes has mean -4.2 and precision of 1.11, still using diuretic as the reference treatment:
+```{r}
+db_pred_FE = predict(db_fit_FE, 
+                      newdata = data.frame(time = 3),
+                      baseline = distr(qnorm, mean = -4.2, sd = 1.11^-0.5), 
+                      trt_ref = "Diuretic",
+                      type = "response")
+
+db_pred_RE <- predict(db_fit_RE, 
+                      newdata = data.frame(time = 3),
+                      baseline = distr(qnorm, mean = -4.2, sd = 1.11^-0.5), 
+                      trt_ref = "Diuretic",
+                      type = "response")
+#matching the order of the rows in the Dias table:
+ridx=c(1,6,4,5,2,3)
+rnames=c('Diuretic', 'Placebo', 'BetaBlocker', 'CCB', 'ACEInhib', 'ARB')
+cnames=c('mean', 'sd', '50%', '2.5%', '97.5%')
+FE_prob_tbl=as.matrix(round(db_pred_FE$summary[ridx,cnames],3))
+RE_prob_tbl=as.matrix(round(db_pred_RE$summary[ridx,cnames],3))
+colnames(FE_prob_tbl)=columnlist
+colnames(RE_prob_tbl)=columnlist
+rownames(FE_prob_tbl)=rnames
+rownames(RE_prob_tbl)=rnames
+taus=as.matrix(db_fit_RE)
+taus=taus[,'tau']
+loCI=quantile(taus,probs=0.025)
+hiCI=quantile(taus,probs=0.975)
+TAU=round(c(mean(taus), sd(taus), median(taus), loCI, hiCI),2)
+RE_prob_tbl=rbind(RE_prob_tbl, TAU)
+```
+## Fixed Effects Model
+```{r}
+FE_sum_tbl
+FE_prob_tbl
+dic_FE
+```
+## Random Effects Model
+```{r}
+RE_sum_tbl
+RE_prob_tbl
+dic_RE
+```
